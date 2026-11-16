@@ -36,15 +36,33 @@ class FakeBackend:
 
     delay: float = 0.0
     status: int = 200
-    mode: str = "ok"  # ok | malformed | short | duplicate_index | bad_coalesce
+    # ok | malformed | short | duplicate_index | bad_coalesce |
+    # truncated | read_timeout | connect_error | complete_after
+    mode: str = "ok"
     shuffle: bool = True
     dim: int = 4
+    # For mode == "complete_after": seconds after which a late response is
+    # produced by the attempt that was abandoned by the gateway timeout.
+    late_response_after: float = 0.0
     calls: list[Call] = field(default_factory=list)
     active: int = 0
     max_active: int = 0
     on_call: Any = None
+    slot_busy: bool = False
+    slot_checks: int = 0
 
-    async def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx.Request) -> Any:
+        if request.method == "GET":
+            return self._handle_get(request)
+        return self._handle_post(request)
+
+    def _handle_get(self, request: httpx.Request) -> httpx.Response:
+        self.slot_checks += 1
+        if self.mode == "slot_error":
+            return httpx.Response(500, text="probe failed")
+        return httpx.Response(200, json={"busy": self.slot_busy})
+
+    async def _handle_post(self, request: httpx.Request) -> httpx.Response:
         loop = asyncio.get_running_loop()
         body = json.loads(request.content)
         texts = body["input"]
@@ -55,6 +73,23 @@ class FakeBackend:
         if self.on_call is not None:
             await self.on_call(len(self.calls))
         try:
+            if self.mode == "connect_error":
+                raise httpx.ConnectError("connection refused", request=request)
+            if self.mode == "truncated":
+                # Bytes reached the gateway (so the backend accepted the
+                # request) but the response body is incomplete.
+                raise httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body",
+                    request=request,
+                )
+            if self.mode == "read_timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            if self.mode == "complete_after":
+                # The gateway's own timeout fires first; this attempt later
+                # completes, producing a genuine late response.
+                await asyncio.sleep(self.late_response_after)
+                call.status = 200
+                return self._ok_response(texts)
             if self.delay:
                 await asyncio.sleep(self.delay)
             call.status = self.status
@@ -89,6 +124,17 @@ class FakeBackend:
             call.end = loop.time()
             self.active -= 1
 
+    def _ok_response(self, texts: list[str]) -> httpx.Response:
+        data = [
+            {
+                "object": "embedding",
+                "index": index,
+                "embedding": vector_for(text, self.dim),
+            }
+            for index, text in enumerate(texts)
+        ]
+        return httpx.Response(200, json={"object": "list", "data": data})
+
     @property
     def batch_sizes(self) -> list[int]:
         return [len(call.texts) for call in self.calls]
@@ -104,12 +150,16 @@ def make_settings(**overrides: Any) -> Settings:
         "backend_model": "fake-model",
         "backend_timeout_seconds": 10.0,
         "backend_connect_timeout_seconds": 2.0,
+        "backend_late_response_grace_seconds": 10.0,
         "batch_window_ms": 20,
         "max_texts_per_request": 4,
         "max_texts_per_batch": 8,
         "default_timeout_ms": 5000,
         "max_timeout_ms": 600000,
         "disconnect_poll_interval_ms": 10,
+        "state_file": None,
+        "backend_admin_url": None,
+        "recovery_probe_timeout_seconds": 2.0,
     }
     defaults.update(overrides)
     return Settings(**defaults)
@@ -120,9 +170,7 @@ async def gateway_client(
     backend: FakeBackend, **settings_overrides: Any
 ) -> AsyncIterator[tuple[Any, httpx.AsyncClient]]:
     settings = make_settings(**settings_overrides)
-    app = create_app(
-        settings, backend_transport=httpx.MockTransport(backend)
-    )
+    app = create_app(settings, backend_transport=httpx.MockTransport(backend))
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(

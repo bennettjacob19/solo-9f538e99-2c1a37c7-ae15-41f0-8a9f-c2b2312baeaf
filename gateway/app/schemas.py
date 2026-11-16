@@ -78,6 +78,50 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
+class FaultInfo(BaseModel):
+    fault_id: str
+    reason: str
+    detail: str | None = None
+    batch_id: str | None = None
+    source: str | None = None
+    created_at: str | None = None
+    restored_after_restart: bool = False
+    restored_at: str | None = None
+
+
+class FaultStatusResponse(BaseModel):
+    active: bool
+    dispatch_paused: bool
+    fault: FaultInfo | None = None
+    persistence_enabled: bool = False
+    hint: str = (
+        "When the backend is confirmed idle, POST /admin/fault/recover with "
+        "the active fault_id."
+    )
+
+
+class RecoveryRequest(BaseModel):
+    fault_id: str = Field(
+        description="The fault_id being recovered. Must match the active fault."
+    )
+    operator: str | None = Field(
+        default=None, description="Who confirmed the backend is idle."
+    )
+    reason: str | None = Field(
+        default=None, description="Why the backend was declared idle."
+    )
+
+
+class RecoveryResponse(BaseModel):
+    recovered: bool
+    fault_id: str
+    previous_fault: FaultInfo
+    backend_probe: dict[str, Any]
+    operator: str | None = None
+    reason: str | None = None
+    recovered_at: str
+
+
 class StatsResponse(BaseModel):
     accepted_requests: int
     completed_requests: int
@@ -87,6 +131,15 @@ class StatsResponse(BaseModel):
     batches_dispatched: int
     backend_errors: int
     backend_texts_sent: int
+    unconfirmed_errors: int = 0
+    rejected_requests: int = 0
+    faults_created: int = 0
+    recoveries: int = 0
+    restored_faults: int = 0
+    late_results_dropped: int = 0
     pending_requests: int
     in_flight: bool
+    dispatch_paused: bool = False
+    fault: dict[str, Any] | None = None
+    persistence_enabled: bool = False
     last_batch: dict[str, Any] | None = None

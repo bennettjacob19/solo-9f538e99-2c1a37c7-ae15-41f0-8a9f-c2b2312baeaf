@@ -11,8 +11,14 @@ services:
       MOCK_SHUFFLE_RESPONSE: "${MOCK_SHUFFLE_RESPONSE:-false}"
       MOCK_MAX_INPUTS: "${MOCK_MAX_INPUTS:-8}"
       MOCK_DIM: "${MOCK_DIM:-8}"
+      MOCK_COMPUTE_AFTER_ABORT_MS: "${MOCK_COMPUTE_AFTER_ABORT_MS:-2000}"
     ports:
       - "${BACKEND_PORT:-9000}:9000"
+    # The isolation state (busy slot, injected mode, counters) must persist
+    # across restarts so a gateway restart cannot make an unconfirmed batch
+    # look idle.  /slot is served from this same in-memory state.
+    volumes:
+      - backend-state:/var/lib/embedding-backend
     healthcheck:
       test:
         - CMD
@@ -23,6 +29,7 @@ services:
       timeout: 3s
       retries: 20
       start_period: 2s
+    restart: unless-stopped
 
   gateway:
     build:
@@ -30,16 +37,27 @@ services:
     image: embedding-batch-gateway:latest
     environment:
       EMBEDDING_BACKEND_URL: "http://backend:9000/v1/embeddings"
+      # Used by recovery to verify the backend slot is really idle before a
+      # fault is cleared.
+      EMBEDDING_BACKEND_ADMIN_URL: "http://backend:9000"
       EMBEDDING_MODEL: "${EMBEDDING_MODEL:-local-demo}"
       EMBEDDING_BACKEND_TIMEOUT_SECONDS: "${EMBEDDING_BACKEND_TIMEOUT_SECONDS:-30}"
+      EMBEDDING_BACKEND_LATE_RESPONSE_GRACE_SECONDS: "${EMBEDDING_BACKEND_LATE_RESPONSE_GRACE_SECONDS:-30}"
       GATEWAY_BATCH_WINDOW_MS: "${GATEWAY_BATCH_WINDOW_MS:-20}"
       GATEWAY_MAX_TEXTS_PER_REQUEST: "${GATEWAY_MAX_TEXTS_PER_REQUEST:-4}"
       GATEWAY_MAX_TEXTS_PER_BATCH: "${GATEWAY_MAX_TEXTS_PER_BATCH:-8}"
       GATEWAY_DEFAULT_TIMEOUT_MS: "${GATEWAY_DEFAULT_TIMEOUT_MS:-5000}"
       GATEWAY_MAX_TIMEOUT_MS: "${GATEWAY_MAX_TIMEOUT_MS:-600000}"
       GATEWAY_DISCONNECT_POLL_INTERVAL_MS: "${GATEWAY_DISCONNECT_POLL_INTERVAL_MS:-20}"
+      GATEWAY_STATE_FILE: "/var/lib/embedding-gateway/state.json"
+      GATEWAY_RECOVERY_PROBE_TIMEOUT_SECONDS: "${GATEWAY_RECOVERY_PROBE_TIMEOUT_SECONDS:-3}"
     ports:
       - "${GATEWAY_PORT:-8000}:8000"
+    volumes:
+      # Persists the active fault and last-dispatch record.  Without this a
+      # `compose up` after an unconfirmed batch would start with an empty
+      # slot and could double-book the single backend slot.
+      - gateway-state:/var/lib/embedding-gateway
     depends_on:
       backend:
         condition: service_healthy
@@ -53,3 +71,8 @@ services:
       timeout: 3s
       retries: 20
       start_period: 3s
+    restart: unless-stopped
+
+volumes:
+  backend-state:
+  gateway-state:

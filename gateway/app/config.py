@@ -34,6 +34,20 @@ class Settings:
     backend_api_key: str | None = None
     backend_timeout_seconds: float = 30.0
     backend_connect_timeout_seconds: float = 5.0
+    # How long a timed-out backend call may keep running in the background so
+    # a genuinely late response can be observed and safely discarded.  The
+    # gateway's own read timeout is ``backend_timeout_seconds``; the HTTP
+    # client timeout is the sum, so the late callback always has a hard bound.
+    backend_late_response_grace_seconds: float = 30.0
+
+    # Durable slot state.  When unset, an unconfirmed batch is only remembered
+    # in this process; compose always sets it to a mounted volume.
+    state_file: str | None = None
+    # Optional backend admin base URL.  When set, recovery probes
+    # ``{backend_admin_url}/slot`` and refuses to clear a fault while the
+    # backend still reports work in progress.
+    backend_admin_url: str | None = None
+    recovery_probe_timeout_seconds: float = 3.0
 
     batch_window_ms: int = 20
     max_texts_per_request: int = 4
@@ -45,9 +59,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
-            backend_url=os.getenv(
-                "EMBEDDING_BACKEND_URL", cls.backend_url
-            ),
+            backend_url=os.getenv("EMBEDDING_BACKEND_URL", cls.backend_url),
             backend_model=os.getenv("EMBEDDING_MODEL", cls.backend_model),
             backend_api_key=os.getenv("EMBEDDING_API_KEY") or None,
             backend_timeout_seconds=_env_float(
@@ -58,9 +70,17 @@ class Settings:
                 "EMBEDDING_BACKEND_CONNECT_TIMEOUT_SECONDS",
                 cls.backend_connect_timeout_seconds,
             ),
-            batch_window_ms=_env_int(
-                "GATEWAY_BATCH_WINDOW_MS", cls.batch_window_ms
+            backend_late_response_grace_seconds=_env_float(
+                "EMBEDDING_BACKEND_LATE_RESPONSE_GRACE_SECONDS",
+                cls.backend_late_response_grace_seconds,
             ),
+            state_file=os.getenv("GATEWAY_STATE_FILE") or None,
+            backend_admin_url=os.getenv("EMBEDDING_BACKEND_ADMIN_URL") or None,
+            recovery_probe_timeout_seconds=_env_float(
+                "GATEWAY_RECOVERY_PROBE_TIMEOUT_SECONDS",
+                cls.recovery_probe_timeout_seconds,
+            ),
+            batch_window_ms=_env_int("GATEWAY_BATCH_WINDOW_MS", cls.batch_window_ms),
             max_texts_per_request=_env_int(
                 "GATEWAY_MAX_TEXTS_PER_REQUEST",
                 cls.max_texts_per_request,
@@ -71,9 +91,7 @@ class Settings:
             default_timeout_ms=_env_int(
                 "GATEWAY_DEFAULT_TIMEOUT_MS", cls.default_timeout_ms
             ),
-            max_timeout_ms=_env_int(
-                "GATEWAY_MAX_TIMEOUT_MS", cls.max_timeout_ms
-            ),
+            max_timeout_ms=_env_int("GATEWAY_MAX_TIMEOUT_MS", cls.max_timeout_ms),
             disconnect_poll_interval_ms=_env_int(
                 "GATEWAY_DISCONNECT_POLL_INTERVAL_MS",
                 cls.disconnect_poll_interval_ms,
@@ -84,16 +102,18 @@ class Settings:
         if self.max_texts_per_request < 1:
             raise ValueError("max_texts_per_request must be >= 1")
         if self.max_texts_per_batch < self.max_texts_per_request:
-            raise ValueError(
-                "max_texts_per_batch must be >= max_texts_per_request"
-            )
+            raise ValueError("max_texts_per_batch must be >= max_texts_per_request")
         if self.batch_window_ms < 0:
             raise ValueError("batch_window_ms must be >= 0")
         if self.backend_timeout_seconds <= 0:
             raise ValueError("backend timeout must be > 0")
+        if self.backend_late_response_grace_seconds < 0:
+            raise ValueError("late response grace must be >= 0")
         if self.disconnect_poll_interval_ms <= 0:
             raise ValueError("disconnect poll interval must be > 0")
         if self.default_timeout_ms < 1 or self.max_timeout_ms < 1:
             raise ValueError("timeouts must be >= 1 ms")
         if self.default_timeout_ms > self.max_timeout_ms:
             raise ValueError("default_timeout_ms exceeds max_timeout_ms")
+        if self.recovery_probe_timeout_seconds <= 0:
+            raise ValueError("recovery probe timeout must be > 0")
